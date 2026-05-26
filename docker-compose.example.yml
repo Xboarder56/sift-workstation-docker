@@ -1,0 +1,59 @@
+# Example Docker Compose file for running SIFT Workstation as a persistent
+# SSH-accessible container.
+#
+# Copy this file to docker-compose.yml before editing:
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   cp .env.example .env
+#   docker compose up -d
+#
+# The service is intentionally privileged because common forensic mounting
+# workflows need FUSE, loop devices, and SYS_ADMIN. For one-shot commands that
+# only read evidence and write outputs, prefer scripts/run.sh instead.
+
+services:
+  sift:
+    image: ${SIFT_IMAGE:-sift-workstation}:${SIFT_TAG:-latest}
+    container_name: ${SIFT_CONTAINER_NAME:-sift-workstation}
+    hostname: ${SIFT_HOSTNAME:-sift-workstation}
+    restart: unless-stopped
+
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - MKNOD
+    devices:
+      - /dev/fuse:/dev/fuse
+
+    environment:
+      TZ: ${TZ:-UTC}
+      TERM: ${TERM:-xterm-256color}
+
+    ports:
+      - "${SIFT_SSH_PORT:-2222}:22"
+
+    volumes:
+      # All case directories. Useful for persistent SSH workflows.
+      - ${SIFT_CASES_DIR:-./cases}:/cases
+
+      # Optional active-case mount. Set SIFT_CASE_DIR in .env to enable.
+      # - ${SIFT_CASE_DIR:?set SIFT_CASE_DIR}:/case
+
+      # Optional read-only evidence mount. Set SIFT_EVIDENCE_DIR in .env to enable.
+      # - ${SIFT_EVIDENCE_DIR:?set SIFT_EVIDENCE_DIR}:/evidence:ro
+
+    networks:
+      - sift_net
+      # Use this form only if you need a stable container IP:
+      # sift_net:
+      #   ipv4_address: ${SIFT_IPV4:-172.16.0.2}
+
+networks:
+  sift_net:
+    name: ${SIFT_NETWORK_NAME:-sift_net}
+    # Uncomment this block only when using a static ipv4_address above.
+    # ipam:
+    #   driver: default
+    #   config:
+    #     - subnet: ${SIFT_SUBNET:-172.16.0.0/16}
+    #       gateway: ${SIFT_GATEWAY:-172.16.0.1}

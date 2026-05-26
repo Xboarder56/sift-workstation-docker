@@ -1,0 +1,174 @@
+name: SIFT Workstation Docker
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ubuntu_version:
+        description: "Ubuntu base image version"
+        required: true
+        default: "24.04"
+      sift_version:
+        description: "SIFT saltstack release tag, or latest"
+        required: true
+        default: "latest"
+      cast_version:
+        description: "Cast release version without leading v"
+        required: true
+        default: "1.0.13"
+      publish_platforms:
+        description: "Comma-separated Docker platforms for publish builds"
+        required: true
+        default: "linux/amd64,linux/arm64"
+      publish_ghcr:
+        description: "Publish image to GitHub Container Registry"
+        type: boolean
+        required: true
+        default: false
+      publish_dockerhub:
+        description: "Publish image to Docker Hub"
+        type: boolean
+        required: true
+        default: false
+      dockerhub_image:
+        description: "Docker Hub image name, for example xboarder56/sift-workstation"
+        required: false
+        default: "xboarder56/sift-workstation"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_IMAGE: ghcr.io/xboarder56/sift-workstation
+  DOCKERHUB_IMAGE: ${{ github.event.inputs.dockerhub_image || 'xboarder56/sift-workstation' }}
+  UBUNTU_VERSION: ${{ github.event.inputs.ubuntu_version || '24.04' }}
+  BASE_IMAGE: ubuntu:${{ github.event.inputs.ubuntu_version || '24.04' }}
+  SIFT_VERSION: ${{ github.event.inputs.sift_version || 'latest' }}
+  CAST_VERSION: ${{ github.event.inputs.cast_version || '1.0.13' }}
+  PUBLISH_PLATFORMS: ${{ github.event.inputs.publish_platforms || 'linux/amd64,linux/arm64' }}
+
+jobs:
+  validate-amd64:
+    name: Build and validate amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local validation image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: sift-workstation:ci
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || '' }}
+            GIT_COMMIT=${{ github.sha }}
+            IMAGE_VERSION=ci
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_DOCUMENTATION=${{ github.server_url }}/${{ github.repository }}#readme
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_AUTHORS=${{ github.repository_owner }}
+            CAST_VERSION=${{ env.CAST_VERSION }}
+            SIFT_VERSION=${{ env.SIFT_VERSION }}
+            SIFT_TARGET=sift
+            SIFT_MODE=server
+            RUN_VALIDATION=false
+
+      - name: Validate container contract
+        run: docker run --rm sift-workstation:ci /opt/dfir/validation/validate-container.sh
+
+  publish:
+    name: Publish multi-arch image
+    runs-on: ubuntu-24.04
+    needs: validate-amd64
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event.inputs.publish_ghcr == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: github.event.inputs.publish_dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+
+          tags=()
+          add_tags() {
+            local image="$1"
+            tags+=("${image}:latest")
+            if [[ -n "${SIFT_VERSION}" && "${SIFT_VERSION}" != "latest" ]]; then
+              tags+=("${image}:${SIFT_VERSION}")
+            fi
+            tags+=("${image}:sha-${short_sha}")
+          }
+
+          if [[ "${{ github.event.inputs.publish_ghcr }}" == "true" ]]; then
+            add_tags "${GHCR_IMAGE}"
+          fi
+          if [[ "${{ github.event.inputs.publish_dockerhub }}" == "true" ]]; then
+            add_tags "${DOCKERHUB_IMAGE}"
+          fi
+
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PUBLISH_PLATFORMS }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || '' }}
+            GIT_COMMIT=${{ github.sha }}
+            IMAGE_VERSION=${{ env.SIFT_VERSION }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_DOCUMENTATION=${{ github.server_url }}/${{ github.repository }}#readme
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_AUTHORS=${{ github.repository_owner }}
+            CAST_VERSION=${{ env.CAST_VERSION }}
+            SIFT_VERSION=${{ env.SIFT_VERSION }}
+            SIFT_TARGET=sift
+            SIFT_MODE=server
+            RUN_VALIDATION=false
