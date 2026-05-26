@@ -59,6 +59,7 @@ jobs:
   validate-amd64:
     name: Build and validate amd64
     runs-on: ubuntu-24.04
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true')) }}
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -106,7 +107,6 @@ jobs:
   publish:
     name: Publish multi-arch image
     runs-on: ubuntu-24.04
-    needs: validate-amd64
     if: github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true')
     steps:
       - name: Free disk space
