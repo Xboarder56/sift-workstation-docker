@@ -137,6 +137,17 @@ jobs:
     needs: discover
     if: needs.discover.outputs.should_build == 'true'
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          large-packages: false
+          swap-storage: true
+
       - name: Checkout
         uses: actions/checkout@v4
 

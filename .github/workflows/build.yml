@@ -42,6 +42,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   GHCR_IMAGE: ghcr.io/xboarder56/sift-workstation
   DOCKERHUB_IMAGE: ${{ github.event.inputs.dockerhub_image || 'xboarder56/sift-workstation' }}
@@ -56,6 +60,17 @@ jobs:
     name: Build and validate amd64
     runs-on: ubuntu-24.04
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          large-packages: false
+          swap-storage: true
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -94,6 +109,17 @@ jobs:
     needs: validate-amd64
     if: github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true')
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          large-packages: false
+          swap-storage: true
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -171,4 +197,4 @@ jobs:
             SIFT_VERSION=${{ env.SIFT_VERSION }}
             SIFT_TARGET=sift
             SIFT_MODE=server
-            RUN_VALIDATION=false
+            RUN_VALIDATION=true
