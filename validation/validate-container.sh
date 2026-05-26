@@ -104,4 +104,4 @@ cast --version
 printf '  - python: '
 python3 --version
 printf '  - sshd: '
-sshd -T | awk '/^port / { print $0; exit }'
+sshd -T | awk '/^port / { print }'
