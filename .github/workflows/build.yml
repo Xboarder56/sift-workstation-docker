@@ -144,6 +144,25 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve SIFT version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${SIFT_VERSION}" == "latest" ]]; then
+            resolved="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/teamdfir/sift-saltstack/releases/latest" \
+              | jq -r '.tag_name // empty')"
+            if [[ -z "${resolved}" || "${resolved}" == "null" ]]; then
+              echo "Unable to resolve latest SIFT release tag" >&2
+              exit 1
+            fi
+            echo "Resolved SIFT_VERSION=latest -> ${resolved}"
+            echo "SIFT_VERSION=${resolved}" >> "${GITHUB_ENV}"
+          else
+            echo "Using explicit SIFT_VERSION=${SIFT_VERSION}"
+          fi
+
       - name: Prepare image tags
         id: tags
         shell: bash
@@ -155,9 +174,7 @@ jobs:
           add_tags() {
             local image="$1"
             tags+=("${image}:latest")
-            if [[ -n "${SIFT_VERSION}" && "${SIFT_VERSION}" != "latest" ]]; then
-              tags+=("${image}:${SIFT_VERSION}")
-            fi
+            tags+=("${image}:${SIFT_VERSION}")
             tags+=("${image}:sha-${short_sha}")
           }
 
