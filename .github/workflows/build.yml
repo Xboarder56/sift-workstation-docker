@@ -23,6 +23,11 @@ on:
         description: "Comma-separated Docker platforms for publish builds"
         required: true
         default: "linux/amd64,linux/arm64"
+      test_pipeline:
+        description: "Run the native multi-arch publish pipeline (build + smoke test by digest) without publishing any tags"
+        type: boolean
+        required: true
+        default: false
       publish_ghcr:
         description: "Publish image to GitHub Container Registry"
         type: boolean
@@ -55,12 +60,15 @@ jobs:
     name: Build and validate amd64 (server + desktop)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true')) }}
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true' || github.event.inputs.test_pipeline == 'true')) }}
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
@@ -69,7 +77,16 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Authenticated pulls avoid Docker Hub's anonymous rate limit. Secrets
+      # are unavailable to PRs from forks, which then pull anonymously.
+      - name: Log in to Docker Hub for pulls
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # No setup-buildx: the default docker driver builds straight into the
       # local image store, so both variants share layers and nothing large
@@ -103,7 +120,7 @@ jobs:
 
       - name: Upload RDP screenshot
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rdp-screenshot-amd64
           path: ${{ runner.temp }}/smoke/*.png
@@ -113,12 +130,12 @@ jobs:
   resolve:
     name: Resolve SIFT version
     runs-on: ubuntu-24.04
-    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true')
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_ghcr == 'true' || github.event.inputs.publish_dockerhub == 'true' || github.event.inputs.test_pipeline == 'true')
     outputs:
       sift_version: ${{ steps.resolve.outputs.sift_version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Resolve SIFT version
         id: resolve
@@ -150,6 +167,8 @@ jobs:
       platforms: ${{ github.event.inputs.publish_platforms || 'linux/amd64,linux/arm64' }}
       publish_ghcr: ${{ github.event.inputs.publish_ghcr == 'true' }}
       publish_dockerhub: ${{ github.event.inputs.publish_dockerhub == 'true' }}
+      # Only the newest upstream release moves the floating latest/desktop tags.
+      move_latest: ${{ (github.event.inputs.sift_version || 'latest') == 'latest' }}
       dockerhub_image: ${{ github.event.inputs.dockerhub_image || 'xboarder56/sift-workstation' }}
     secrets:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}

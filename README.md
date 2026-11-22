@@ -58,7 +58,9 @@ docker run -d --name sift-desktop \
 ```
 
 Connect your RDP client to `127.0.0.1:3389` and log in as `sansforensics`
-with the password you set. Each container generates its own self-signed TLS
+with the password you set. The desktop requires a password: without
+`SIFT_PASSWORD`/`SIFT_PASSWORD_FILE` the container refuses to start RDP,
+so the well-known default password is never exposed over RDP. Each container generates its own self-signed TLS
 certificate on first start, so expect a certificate prompt the first time.
 Sessions keep running when you disconnect. Reconnect to resume.
 
@@ -70,6 +72,9 @@ Notes on GNOME in a container:
   (the Ubuntu session without the power daemon, which needs logind), and
   removes the screen lock, since xrdp handles disconnects. Session logs go
   to `~/.cache/sift-session.log`.
+- The desktop session needs GNOME's X11 session, which Ubuntu 24.04 ships.
+  Ubuntu 25.10 and later drop it, so the desktop variant stays on a 24.04
+  base until xrdp supports Wayland sessions.
 - SIFT's own Salt `desktop` mode can't be used inside a container: its
   hostname, timezone, Samba, and `gsettings` steps need systemd and a user
   D-Bus session. The image applies the same theme (wallpaper, dock, and
@@ -153,21 +158,26 @@ These environment variables are read when the container starts its services
 | `SIFT_PASSWORD_FILE` | unset | Read the password from a file (Docker/Compose secret). Set only one of the two. |
 | `SIFT_AUTHORIZED_KEYS` | unset | SSH public keys for `sansforensics` |
 | `SIFT_AUTHORIZED_KEYS_FILE` | unset | Read SSH public keys from a file |
-| `SIFT_SSH_PASSWORD_AUTH` | `yes` | `no` allows SSH key logins only |
+| `SIFT_SSH_PASSWORD_AUTH` | `yes` | `no` allows SSH key logins only. Without a password set, this also disables the default password everywhere. |
 | `SIFT_ENABLE_SSH` | `true` | Run sshd |
 | `SIFT_ENABLE_XRDP` | `true` | Run xrdp (desktop image only) |
+| `SIFT_ALLOW_DEFAULT_PASSWORD` | `false` | Let the desktop start RDP with the default password (isolated labs only) |
 
-If no password is provided, the image default lab password `forensics` stays
-active and a warning is logged on every start.
+If no password is provided, the server image keeps the default lab password
+`forensics` active for compatibility, and logs a warning on every start.
 
 ### Security notes
 
-- Every container generates its own SSH host keys and xrdp TLS certificate
-  on first start. No private keys are shipped in the image. They persist for
-  the life of the container. Recreating the container creates new ones, so
-  SSH clients will warn about a changed host key.
+- Every container generates its own SSH host keys, xrdp TLS certificate,
+  xrdp RSA keys, and machine-id on first start. No key from the image is
+  ever used. They persist across restarts, and recreating the container
+  creates new ones, so SSH clients will warn about a changed host key.
 - Change the default password with `SIFT_PASSWORD_FILE` before exposing a
-  container, or use SSH keys with `SIFT_SSH_PASSWORD_AUTH=no`.
+  container. Alternatively, use SSH keys with `SIFT_SSH_PASSWORD_AUTH=no`
+  and no password, which disables the default password entirely.
+- xrdp runs as its own unprivileged `xrdp` user and only accepts TLS. Its
+  VNC and RDP proxy sessions (`vnc-any`, `neutrinordp-any`) are removed, so
+  the login screen can't be used to reach other hosts.
 - `sansforensics` has passwordless sudo, matching a standard SIFT install.
   Treat SSH/RDP access as root access to the container.
 
@@ -303,11 +313,15 @@ Three workflows live in `.github/workflows/`:
   push and PR. It runs the image validation and the SSH/RDP smoke tests,
   and uploads a screenshot of the RDP desktop as a build artifact. Manual
   dispatch publishes multi-arch images when `publish_ghcr` and/or
-  `publish_dockerhub` are toggled on.
+  `publish_dockerhub` are toggled on. `test_pipeline` runs the full native
+  multi-arch build and smoke tests without publishing any tags. Only a
+  `latest` build moves the floating `latest`/`desktop` tags.
 - **`release-watch.yml`** checks upstream `teamdfir/sift-saltstack` once a
   day. It publishes both variants when a new release appears, or when any
-  expected tag (`vX`, `vX-desktop`) is missing. It can also be run manually
-  with `force_rebuild: true`.
+  expected tag (`vX`, `vX-desktop`) is missing from GHCR. If only Docker
+  Hub is behind, it copies the GHCR tags there without rebuilding. It can
+  also be run manually with `force_rebuild: true`. The `publish_dockerhub`
+  input (`auto`/`true`/`false`) overrides the repository variable.
 - **`publish.yml`** is the reusable publish pipeline used by both. Each
   architecture builds on a native runner (`ubuntu-24.04` and
   `ubuntu-24.04-arm`), with no QEMU emulation. Images are pushed untagged by

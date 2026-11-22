@@ -98,11 +98,15 @@ fi
 
 if [[ "${SIFT_VALIDATE_IMAGE_STATE}" == "true" ]]; then
   # Per-container secrets must never be baked into the published image.
-  for key in /etc/ssh/ssh_host_*_key /etc/xrdp/key.pem /etc/ssl/private/ssl-cert-snakeoil.key; do
+  for key in /etc/ssh/ssh_host_*_key /etc/xrdp/key.pem /etc/xrdp/rsakeys.ini \
+             /etc/ssl/private/ssl-cert-snakeoil.key /var/lib/dbus/machine-id; do
     if [[ -e "${key}" ]]; then
       failures+=("image contains a shared private key: ${key}")
     fi
   done
+  if [[ -s /etc/machine-id ]]; then
+    failures+=("image contains a baked /etc/machine-id")
+  fi
 fi
 
 case "${SIFT_VARIANT}" in
@@ -138,6 +142,12 @@ case "${SIFT_VARIANT}" in
         failures+=("desktop autostart entry is not hidden: ${f}")
       fi
     done
+    if grep -qE '^\[(Xvnc|vnc-any|neutrinordp-any)\]' /etc/xrdp/xrdp.ini 2>/dev/null; then
+      failures+=("xrdp.ini still offers proxy/VNC sessions (vnc-any/neutrinordp-any/Xvnc)")
+    fi
+    if ! grep -qx 'security_layer=tls' /etc/xrdp/xrdp.ini 2>/dev/null; then
+      failures+=("xrdp.ini does not enforce TLS (security_layer=tls)")
+    fi
     if ! id -nG xrdp 2>/dev/null | grep -qw ssl-cert; then
       failures+=("xrdp user is not in the ssl-cert group")
     fi

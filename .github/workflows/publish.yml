@@ -28,6 +28,10 @@ on:
       publish_dockerhub:
         type: boolean
         default: false
+      move_latest:
+        description: "Also move the floating latest/desktop tags"
+        type: boolean
+        default: true
       dockerhub_image:
         type: string
         default: "xboarder56/sift-workstation"
@@ -77,6 +81,8 @@ jobs:
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -86,6 +92,7 @@ jobs:
         continue-on-error: true
         with:
           tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
@@ -93,22 +100,34 @@ jobs:
           large-packages: false
           swap-storage: true
 
+      - name: Disk space before build
+        run: df -h / /mnt 2>/dev/null || df -h /
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Authenticated pulls (base image, BuildKit, SBOM scanner, smoke client)
+      # avoid Docker Hub's anonymous rate limit on shared runner IPs.
+      - name: Log in to Docker Hub for pulls
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push server (by digest)
         id: server
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
@@ -134,7 +153,7 @@ jobs:
 
       - name: Build and push desktop (by digest)
         id: desktop
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
@@ -168,7 +187,7 @@ jobs:
           cat digests/*
 
       - name: Upload digests
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digests-${{ matrix.arch }}
           path: digests/*
@@ -176,6 +195,7 @@ jobs:
 
       - name: Free builder cache before smoke tests
         run: |
+          df -h /
           docker buildx prune --all --force || true
           df -h /
 
@@ -193,7 +213,7 @@ jobs:
 
       - name: Upload RDP screenshot
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rdp-screenshot-${{ matrix.arch }}
           path: ${{ runner.temp }}/smoke/*.png
@@ -204,19 +224,23 @@ jobs:
     name: Create multi-arch tags
     needs: build
     runs-on: ubuntu-24.04
+    # Serialize tag updates across all publish runs (release watch + manual).
+    concurrency:
+      group: sift-publish-tags
+      cancel-in-progress: false
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: digests
           pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -224,7 +248,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: inputs.publish_dockerhub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -235,11 +259,17 @@ jobs:
           SIFT_VERSION: ${{ inputs.sift_version }}
           PUBLISH_GHCR: ${{ inputs.publish_ghcr }}
           PUBLISH_DOCKERHUB: ${{ inputs.publish_dockerhub }}
+          MOVE_LATEST: ${{ inputs.move_latest }}
           DOCKERHUB_IMAGE: ${{ inputs.dockerhub_image }}
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA::12}"
           ls -la digests
+
+          if [[ "$PUBLISH_GHCR" != "true" && "$PUBLISH_DOCKERHUB" != "true" ]]; then
+            echo "Test run: images were built and smoke-tested by digest; no tags published."
+            exit 0
+          fi
 
           for variant in server desktop; do
             sources=()
@@ -247,9 +277,11 @@ jobs:
               sources+=("${GHCR_IMAGE}@$(cat "$f")")
             done
             if [[ "$variant" == server ]]; then
-              suffixes=("latest" "${SIFT_VERSION}" "sha-${short_sha}")
+              suffixes=("${SIFT_VERSION}" "sha-${short_sha}")
+              [[ "$MOVE_LATEST" == "true" ]] && suffixes+=("latest")
             else
-              suffixes=("desktop" "${SIFT_VERSION}-desktop" "sha-${short_sha}-desktop")
+              suffixes=("${SIFT_VERSION}-desktop" "sha-${short_sha}-desktop")
+              [[ "$MOVE_LATEST" == "true" ]] && suffixes+=("desktop")
             fi
 
             registries=()
@@ -261,7 +293,7 @@ jobs:
               for s in "${suffixes[@]}"; do args+=(--tag "${registry}:${s}"); done
               echo "::group::${variant} -> ${registry}"
               docker buildx imagetools create "${args[@]}" "${sources[@]}"
-              docker buildx imagetools inspect "${registry}:${suffixes[1]}"
+              docker buildx imagetools inspect "${registry}:${suffixes[0]}"
               echo "::endgroup::"
             done
           done

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Entrypoint for sift-workstation-docker. Runs under tini (PID 1).
+# Entrypoint for sift-workstation-docker. Runs under tini.
 #
 #   sift-services (default CMD)  Prepare per-container secrets and run sshd,
 #                                plus xrdp on the desktop image.
+#   sshd / /usr/sbin/sshd ...    The previous default CMD: same preparation,
+#                                then runs the given sshd command.
 #   anything else                Executed directly, as with earlier images
 #                                (e.g. `bash`, `log2timeline.py ...`).
 #
@@ -10,13 +12,18 @@
 #   SIFT_PASSWORD / SIFT_PASSWORD_FILE    Set the SIFT user's password.
 #   SIFT_AUTHORIZED_KEYS / _FILE          SSH public keys for the SIFT user.
 #   SIFT_SSH_PASSWORD_AUTH=yes|no         Allow SSH password logins (default yes).
+#                                         With `no` and no password set, the
+#                                         default password is disabled.
 #   SIFT_ENABLE_SSH=true|false            Run sshd (default true).
 #   SIFT_ENABLE_XRDP=true|false           Run xrdp on the desktop image (default true).
+#   SIFT_ALLOW_DEFAULT_PASSWORD=true      Let xrdp start with the image default
+#                                         password (refused otherwise).
 set -euo pipefail
 
 SIFT_USER="${SIFT_USER:-sansforensics}"
-SIFT_HOME="$(getent passwd "${SIFT_USER}" | cut -d: -f6)"
+SIFT_HOME="$(getent passwd "${SIFT_USER}" | cut -d: -f6 || true)"
 SIFT_HOME="${SIFT_HOME:-/home/${SIFT_USER}}"
+PASSWORD_SET=false
 
 log() { printf '[sift-entrypoint] %s\n' "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
@@ -45,12 +52,25 @@ read_setting() {
   REPLY="${value}"
 }
 
+ensure_machine_id() {
+  # A baked machine-id would be shared by every container; create one per
+  # container (D-Bus and GNOME use it).
+  if [[ ! -s /etc/machine-id ]] && command -v dbus-uuidgen >/dev/null 2>&1; then
+    # The image ships an empty file (`--ensure` rejects empty files).
+    dbus-uuidgen > /etc/machine-id.tmp 2>/dev/null && mv -f /etc/machine-id.tmp /etc/machine-id || return 0
+  fi
+  if [[ -s /etc/machine-id && -d /var/lib/dbus && ! -e /var/lib/dbus/machine-id ]]; then
+    ln -s /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
+  fi
+}
+
 ensure_ssh_host_keys() {
   if ! compgen -G '/etc/ssh/ssh_host_*_key' >/dev/null; then
     log "Generating unique SSH host keys for this container"
   fi
   # Creates only the key types that are missing; keeps persisted keys.
   ssh-keygen -A >/dev/null
+  mkdir -p /run/sshd
 }
 
 configure_ssh() {
@@ -60,7 +80,7 @@ configure_ssh() {
     no|false) password_auth=no ;;
     *) die "SIFT_SSH_PASSWORD_AUTH must be yes or no, got: '${password_auth}'" ;;
   esac
-  mkdir -p /etc/ssh/sshd_config.d /run/sshd
+  mkdir -p /etc/ssh/sshd_config.d
   # Drop-ins are read before the main config and the first value wins.
   printf '%s\n' \
     '# Managed by sift-entrypoint on every start.' \
@@ -71,16 +91,32 @@ configure_ssh() {
 }
 
 configure_credentials() {
+  local ssh_password_auth="${SIFT_SSH_PASSWORD_AUTH:-yes}"
+  ssh_password_auth="${ssh_password_auth,,}"
   read_setting SIFT_PASSWORD
   local password="${REPLY}"
+  unset SIFT_PASSWORD
+  # Tolerate a trailing CR from Windows-edited secret files, but never pass
+  # embedded newlines to chpasswd (they would be read as extra user:password
+  # lines, e.g. for root).
+  password="${password%$'\r'}"
+  if [[ "${password}" == *$'\n'* || "${password}" == *$'\r'* ]]; then
+    die "SIFT_PASSWORD must be a single line"
+  fi
+
   if [[ -n "${password}" ]]; then
     printf '%s:%s\n' "${SIFT_USER}" "${password}" | chpasswd
+    PASSWORD_SET=true
     log "Set password for ${SIFT_USER} from SIFT_PASSWORD"
+  elif [[ "${ssh_password_auth}" == "no" || "${ssh_password_auth}" == "false" ]]; then
+    # Keys-only setup: make sure the well-known default password cannot be
+    # used anywhere (RDP, su, console). '*' keeps SSH key logins working.
+    usermod -p '*' "${SIFT_USER}"
+    log "No SIFT_PASSWORD and SSH password auth disabled: password login disabled for ${SIFT_USER}"
   else
     log "WARNING: ${SIFT_USER} still uses the image default password." \
         "Set SIFT_PASSWORD or SIFT_PASSWORD_FILE before exposing this container."
   fi
-  unset SIFT_PASSWORD
 
   read_setting SIFT_AUTHORIZED_KEYS
   local keys="${REPLY}"
@@ -93,8 +129,13 @@ configure_credentials() {
   fi
 }
 
-ensure_xrdp_tls() {
-  # Unique self-signed TLS identity per container (kept if /etc/xrdp persists).
+prepare_xrdp() {
+  if [[ "${PASSWORD_SET}" != true ]] && ! is_true "${SIFT_ALLOW_DEFAULT_PASSWORD:-false}"; then
+    die "the RDP desktop needs a password: set SIFT_PASSWORD or SIFT_PASSWORD_FILE" \
+        "(or SIFT_ENABLE_XRDP=false, or SIFT_ALLOW_DEFAULT_PASSWORD=true for an isolated lab)"
+  fi
+
+  # Unique self-signed TLS identity per container (kept across restarts).
   if [[ ! -s /etc/xrdp/key.pem || ! -s /etc/xrdp/cert.pem ]]; then
     log "Generating unique xrdp TLS certificate for this container"
     rm -f /etc/xrdp/key.pem /etc/xrdp/cert.pem
@@ -102,15 +143,43 @@ ensure_xrdp_tls() {
       -subj "/CN=$(hostname)" \
       -keyout /etc/xrdp/key.pem -out /etc/xrdp/cert.pem >/dev/null 2>&1
   fi
-  chown root:xrdp /etc/xrdp/key.pem /etc/xrdp/cert.pem 2>/dev/null || true
+  chown root:xrdp /etc/xrdp/key.pem /etc/xrdp/cert.pem
   chmod 0640 /etc/xrdp/key.pem
   chmod 0644 /etc/xrdp/cert.pem
-}
 
-start_dbus() {
+  # Legacy RDP-security keys (unused with security_layer=tls) are per
+  # container too, so no private key from the image is ever used.
+  if [[ ! -s /etc/xrdp/rsakeys.ini ]]; then
+    xrdp-keygen xrdp /etc/xrdp/rsakeys.ini >/dev/null 2>&1
+  fi
+  chown root:xrdp /etc/xrdp/rsakeys.ini
+  chmod 0640 /etc/xrdp/rsakeys.ini
+
+  # GNOME Shell assumes logind when this exists; there is no logind here.
+  rm -rf /run/systemd/seats /run/systemd/sessions
+
+  # Stale state from a previous run of this container (docker restart):
+  # X display locks would otherwise use up sesman's display range over time.
+  rm -f /tmp/.X1[0-9]-lock /tmp/.X[2-9][0-9]-lock
+  rm -f /tmp/.X11-unix/X1[0-9] /tmp/.X11-unix/X[2-9][0-9]
+  rm -rf /tmp/.xrdp/* /var/run/xrdp/*.pid /run/xrdp/*.pid 2>/dev/null || true
+
+  # Same runtime-directory setup as Ubuntu's xrdp.service, so xrdp itself
+  # can run unprivileged as the `xrdp` user (sesman stays root to start
+  # sessions).
+  /bin/sh /usr/share/xrdp/socksetup
+  touch /var/log/xrdp.log
+  chown xrdp:adm /var/log/xrdp.log
+  chmod 0640 /var/log/xrdp.log
+
   mkdir -p /run/dbus
   rm -f /run/dbus/pid
   dbus-daemon --system --fork
+}
+
+prepare_ssh() {
+  configure_ssh
+  ensure_ssh_host_keys
 }
 
 PIDS=()
@@ -132,25 +201,17 @@ run_services() {
   fi
   [[ "${run_ssh}" == true || "${run_xrdp}" == true ]] || die "no services enabled"
 
+  ensure_machine_id
   configure_credentials
-
-  if [[ "${run_ssh}" == true ]]; then
-    ensure_ssh_host_keys
-    configure_ssh
-  fi
-  if [[ "${run_xrdp}" == true ]]; then
-    ensure_xrdp_tls
-    # GNOME Shell assumes logind when this exists; there is no logind here.
-    rm -rf /run/systemd/seats /run/systemd/sessions
-    start_dbus
-    rm -f /var/run/xrdp/*.pid /run/xrdp/*.pid 2>/dev/null || true
-  fi
+  [[ "${run_ssh}" == true ]] && prepare_ssh
+  [[ "${run_xrdp}" == true ]] && prepare_xrdp
 
   trap shutdown TERM INT
 
   if [[ "${run_xrdp}" == true ]]; then
     /usr/sbin/xrdp-sesman --nodaemon & PIDS+=("$!")
-    /usr/sbin/xrdp --nodaemon & PIDS+=("$!")
+    setpriv --reuid=xrdp --regid=xrdp --init-groups \
+      /usr/sbin/xrdp --nodaemon & PIDS+=("$!")
     log "xrdp listening on port 3389 (RDP)"
   fi
   if [[ "${run_ssh}" == true ]]; then
@@ -171,9 +232,16 @@ if [[ $# -eq 0 || "$1" == "sift-services" ]]; then
   run_services
 fi
 
-# Backward compatibility: running sshd directly (the previous default CMD).
 case "$1" in
-  sshd|/usr/sbin/sshd) ensure_ssh_host_keys; mkdir -p /run/sshd ;;
+  sshd|/usr/sbin/sshd)
+    # Backward compatibility with the previous default CMD (`/usr/sbin/sshd -D`).
+    ensure_machine_id
+    configure_credentials
+    prepare_ssh
+    ;;
+  *)
+    if [[ -w /etc ]]; then ensure_machine_id; fi
+    ;;
 esac
 
 exec "$@"
