@@ -367,6 +367,7 @@ Other optional repository variables:
 | `CAST_VERSION` | `1.0.42` | Cast release version without leading `v` |
 | `CAST_SHA256_AMD64` / `CAST_SHA256_ARM64` | pinned for the default version | Expected Cast `.deb` checksums |
 | `SIFT_VERSION` | `latest` | SIFT saltstack release. `latest` resolves to the current release at install time; `v2026.10.19` pins via `sift@v2026.10.19` |
+| `CAST_INSTALL_ATTEMPTS` | `3` | Retries for `cast install`, which fails on transient outages of the many third-party download sites the SIFT states use |
 | `SIFT_TARGET` | `sift` | Cast distro alias or repository |
 | `SIFT_MODE` | `server` | SIFT install mode |
 | `RUN_VALIDATION` | `false` | Run `/opt/dfir/validation/validate-container.sh` during build |

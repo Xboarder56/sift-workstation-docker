@@ -20,6 +20,10 @@ ARG CAST_PINNED_VERSION=1.0.42
 ARG CAST_SHA256_AMD64=9775d46a42f77030407cd3ba37d5f32334d50e0d4b021ece113c23cbea2c7573
 ARG CAST_SHA256_ARM64=b527fd8592af2520ddd3457cba9538c7e80013b8c58174ab402ac69c03a0c369
 ARG SIFT_VERSION=latest
+# The SIFT Salt states download from many third-party sites; a transient
+# outage of any one (e.g. exiftool.org) fails the run. Salt is idempotent,
+# so retrying only redoes the unfinished work.
+ARG CAST_INSTALL_ATTEMPTS=3
 ARG SIFT_TARGET=sift
 ARG SIFT_MODE=server
 ARG SIFT_USER=sansforensics
@@ -107,7 +111,15 @@ RUN set -eux; \
     if [[ -n "${SIFT_VERSION}" && "${SIFT_VERSION}" != "latest" ]]; then \
         sift_spec="${SIFT_TARGET}@${SIFT_VERSION}"; \
     fi; \
-    cast install --mode "${SIFT_MODE}" --user "${SIFT_USER}" "${sift_spec}"; \
+    attempt=1; \
+    until cast install --mode "${SIFT_MODE}" --user "${SIFT_USER}" "${sift_spec}"; do \
+        if (( attempt >= CAST_INSTALL_ATTEMPTS )); then \
+            echo "FATAL: cast install failed after ${attempt} attempts" >&2; exit 1; \
+        fi; \
+        echo "cast install attempt ${attempt} failed; retrying in $(( attempt * 60 ))s" >&2; \
+        sleep $(( attempt * 60 )); \
+        attempt=$(( attempt + 1 )); \
+    done; \
     rm -f "./${cast_deb}"
 
 RUN set -eux; \
