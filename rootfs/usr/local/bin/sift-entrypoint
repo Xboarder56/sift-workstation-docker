@@ -239,9 +239,9 @@ case "$1" in
     configure_credentials
     prepare_ssh
     ;;
-  *)
-    if [[ -w /etc ]]; then ensure_machine_id; fi
-    ;;
 esac
+
+# Other commands run exactly as given: no services, so no per-container
+# identity (keys, machine-id) is created for one-shot runs.
 
 exec "$@"

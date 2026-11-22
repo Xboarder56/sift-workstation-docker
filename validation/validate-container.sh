@@ -99,13 +99,13 @@ fi
 if [[ "${SIFT_VALIDATE_IMAGE_STATE}" == "true" ]]; then
   # Per-container secrets must never be baked into the published image.
   for key in /etc/ssh/ssh_host_*_key /etc/xrdp/key.pem /etc/xrdp/rsakeys.ini \
-             /etc/ssl/private/ssl-cert-snakeoil.key /var/lib/dbus/machine-id; do
+             /etc/ssl/private/ssl-cert-snakeoil.key; do
     if [[ -e "${key}" ]]; then
       failures+=("image contains a shared private key: ${key}")
     fi
   done
-  if [[ -s /etc/machine-id ]]; then
-    failures+=("image contains a baked /etc/machine-id")
+  if [[ -s /etc/machine-id || -e /var/lib/dbus/machine-id ]]; then
+    failures+=("image contains a baked machine-id (would be shared by every container)")
   fi
 fi
 

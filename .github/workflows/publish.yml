@@ -134,7 +134,9 @@ jobs:
           target: server
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          sbom: true
+          # In-image SBOM attestations are capped at 80 MB by BuildKit and the
+          # desktop SBOM exceeds that; SBOMs are generated below with Syft.
+          sbom: false
           provenance: mode=max
           build-args: |
             BASE_IMAGE=ubuntu:${{ inputs.ubuntu_version }}
@@ -160,7 +162,9 @@ jobs:
           target: desktop
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          sbom: true
+          # In-image SBOM attestations are capped at 80 MB by BuildKit and the
+          # desktop SBOM exceeds that; SBOMs are generated below with Syft.
+          sbom: false
           provenance: mode=max
           build-args: |
             BASE_IMAGE=ubuntu:${{ inputs.ubuntu_version }}
@@ -210,6 +214,30 @@ jobs:
         run: |
           docker pull "${GHCR_IMAGE}@${{ steps.desktop.outputs.digest }}"
           ./scripts/smoke-test.sh "${GHCR_IMAGE}@${{ steps.desktop.outputs.digest }}" desktop
+
+      - name: Generate SBOMs (SPDX, Syft)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          for variant in server desktop; do
+            case "$variant" in
+              server) digest="${{ steps.server.outputs.digest }}" ;;
+              desktop) digest="${{ steps.desktop.outputs.digest }}" ;;
+            esac
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              docker.io/anchore/syft:v1.57.2@sha256:e97e20b6e6d1699c60296b66ab337941724f9bd06ac279d893eda89601fc4b2a \
+              "docker:${GHCR_IMAGE}@${digest}" -o spdx-json \
+              | gzip -9 > "sbom/sift-workstation-${variant}-${{ matrix.arch }}.spdx.json.gz"
+          done
+          ls -la sbom
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: sbom/*.spdx.json.gz
+          retention-days: 90
 
       - name: Upload RDP screenshot
         if: always()
