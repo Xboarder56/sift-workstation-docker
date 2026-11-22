@@ -10,3 +10,5 @@ Archive.zip
 *.log
 *.err
 *.tmp
+
+secrets/

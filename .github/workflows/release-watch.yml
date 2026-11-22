@@ -2,7 +2,8 @@ name: SIFT Release Watch
 
 on:
   schedule:
-    - cron: "23 */6 * * *"
+    # Once a day. Upstream SIFT releases a few times a year.
+    - cron: "23 7 * * *"
   workflow_dispatch:
     inputs:
       ubuntu_version:
@@ -12,21 +13,25 @@ on:
       cast_version:
         description: "Cast release version without leading v"
         required: true
-        default: "1.0.13"
+        default: "1.0.42"
       publish_platforms:
         description: "Comma-separated Docker platforms for publish builds"
         required: true
         default: "linux/amd64,linux/arm64"
       force_rebuild:
-        description: "Rebuild even if the SIFT release tag already exists"
+        description: "Rebuild even if the SIFT release tags already exist"
         type: boolean
         required: true
         default: false
       publish_dockerhub:
-        description: "Also publish to Docker Hub"
-        type: boolean
+        description: "Docker Hub publishing: auto = follow the PUBLISH_DOCKERHUB repo variable"
+        type: choice
         required: true
-        default: false
+        default: auto
+        options:
+          - auto
+          - "true"
+          - "false"
       dockerhub_image:
         description: "Docker Hub image name, for example xboarder56/sift-workstation"
         required: false
@@ -43,12 +48,9 @@ concurrency:
 env:
   GHCR_IMAGE: ghcr.io/xboarder56/sift-workstation
   DOCKERHUB_IMAGE: ${{ github.event.inputs.dockerhub_image || vars.DOCKERHUB_IMAGE || 'xboarder56/sift-workstation' }}
-  UBUNTU_VERSION: ${{ github.event.inputs.ubuntu_version || vars.UBUNTU_VERSION || '24.04' }}
-  BASE_IMAGE: ubuntu:${{ github.event.inputs.ubuntu_version || vars.UBUNTU_VERSION || '24.04' }}
-  CAST_VERSION: ${{ github.event.inputs.cast_version || vars.CAST_VERSION || '1.0.13' }}
-  PUBLISH_PLATFORMS: ${{ github.event.inputs.publish_platforms || vars.PUBLISH_PLATFORMS || 'linux/amd64,linux/arm64' }}
   FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || 'false' }}
-  PUBLISH_DOCKERHUB: ${{ github.event.inputs.publish_dockerhub || vars.PUBLISH_DOCKERHUB || 'false' }}
+  # Manual input overrides the repo variable; scheduled runs use the variable.
+  PUBLISH_DOCKERHUB: ${{ (github.event.inputs.publish_dockerhub == 'true' || (github.event.inputs.publish_dockerhub != 'false' && vars.PUBLISH_DOCKERHUB == 'true')) && 'true' || 'false' }}
 
 jobs:
   discover:
@@ -57,26 +59,31 @@ jobs:
     outputs:
       sift_version: ${{ steps.release.outputs.sift_version }}
       should_build: ${{ steps.check.outputs.should_build }}
+      should_sync_dockerhub: ${{ steps.check.outputs.should_sync_dockerhub }}
+      publish_dockerhub: ${{ env.PUBLISH_DOCKERHUB }}
+      dockerhub_image: ${{ env.DOCKERHUB_IMAGE }}
+      ubuntu_version: ${{ github.event.inputs.ubuntu_version || vars.UBUNTU_VERSION || '24.04' }}
+      cast_version: ${{ github.event.inputs.cast_version || vars.CAST_VERSION || '1.0.42' }}
+      platforms: ${{ github.event.inputs.publish_platforms || vars.PUBLISH_PLATFORMS || 'linux/amd64,linux/arm64' }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       - name: Resolve latest upstream release
         id: release
         shell: bash
+        env:
+          # Authenticated API calls avoid the shared 60/hour unauthenticated
+          # limit on hosted runners, which caused intermittent HTTP 403s.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          release_json="$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/teamdfir/sift-saltstack/releases/latest")"
-          sift_version="$(jq -r '.tag_name // empty' <<<"${release_json}")"
-          if [[ -z "${sift_version}" || "${sift_version}" == "null" ]]; then
-            echo "Unable to resolve latest SIFT release tag" >&2
-            exit 1
-          fi
-
+          sift_version="$(./scripts/latest-sift-version.sh)"
           echo "sift_version=${sift_version}" >> "${GITHUB_OUTPUT}"
           echo "Latest upstream SIFT release: ${sift_version}"
 
       - name: Log in to GHCR for tag check
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -84,142 +91,130 @@ jobs:
 
       - name: Log in to Docker Hub for tag check
         if: env.PUBLISH_DOCKERHUB == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Check whether release image already exists
+      - name: Check whether release images already exist
         id: check
         shell: bash
         run: |
           set -euo pipefail
           sift_version="${{ steps.release.outputs.sift_version }}"
-          ghcr_tag="${GHCR_IMAGE}:${sift_version}"
-          dockerhub_tag="${DOCKERHUB_IMAGE}:${sift_version}"
 
           if [[ "${FORCE_REBUILD}" == "true" ]]; then
             echo "Force rebuild requested."
             echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            echo "should_sync_dockerhub=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          ghcr_exists=false
-          dockerhub_exists=true
-
-          if docker buildx imagetools inspect "${ghcr_tag}" >/dev/null 2>&1; then
-            ghcr_exists=true
-            echo "GHCR image tag already exists: ${ghcr_tag}"
-          else
-            echo "GHCR image tag does not exist yet: ${ghcr_tag}"
-          fi
-
-          if [[ "${PUBLISH_DOCKERHUB}" == "true" ]]; then
-            dockerhub_exists=false
-            if docker buildx imagetools inspect "${dockerhub_tag}" >/dev/null 2>&1; then
-              dockerhub_exists=true
-              echo "Docker Hub image tag already exists: ${dockerhub_tag}"
-            else
-              echo "Docker Hub image tag does not exist yet: ${dockerhub_tag}"
+          # 0 = exists, 1 = missing. Any other registry error fails the job
+          # instead of silently triggering a multi-hour rebuild.
+          tag_exists() {
+            local ref="$1" out
+            if out="$(docker buildx imagetools inspect "${ref}" 2>&1 >/dev/null)"; then
+              echo "exists:  ${ref}"; return 0
             fi
+            if grep -qiE 'not found|manifest unknown|name unknown|404' <<<"${out}"; then
+              echo "missing: ${ref}"; return 1
+            fi
+            echo "Registry error while checking ${ref}:" >&2
+            echo "${out}" >&2
+            exit 1
+          }
+
+          ghcr_missing=0
+          for tag in "${sift_version}" "${sift_version}-desktop"; do
+            tag_exists "${GHCR_IMAGE}:${tag}" || ghcr_missing=1
+          done
+
+          dockerhub_missing=0
+          if [[ "${PUBLISH_DOCKERHUB}" == "true" ]]; then
+            for tag in "${sift_version}" "${sift_version}-desktop"; do
+              tag_exists "docker.io/${DOCKERHUB_IMAGE}:${tag}" || dockerhub_missing=1
+            done
           fi
 
-          if [[ "${ghcr_exists}" != "true" || "${dockerhub_exists}" != "true" ]]; then
+          if (( ghcr_missing )); then
             echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            echo "should_sync_dockerhub=false" >> "${GITHUB_OUTPUT}"
+          elif (( dockerhub_missing )); then
+            echo "GHCR is complete; Docker Hub will be synced from GHCR without rebuilding."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "should_sync_dockerhub=true" >> "${GITHUB_OUTPUT}"
           else
             echo "All requested release image tags already exist."
             echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "should_sync_dockerhub=false" >> "${GITHUB_OUTPUT}"
           fi
 
-  publish:
-    name: Build and publish latest SIFT release
-    runs-on: ubuntu-24.04
+  sync-dockerhub:
+    name: Copy release tags from GHCR to Docker Hub
     needs: discover
-    if: needs.discover.outputs.should_build == 'true'
+    if: needs.discover.outputs.should_sync_dockerhub == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: sift-publish-tags
+      cancel-in-progress: false
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          docker-images: true
-          large-packages: false
-          swap-storage: true
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        if: env.PUBLISH_DOCKERHUB == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Prepare image tags
-        id: tags
+      - name: Copy tags (same digests)
         shell: bash
+        env:
+          SIFT_VERSION: ${{ needs.discover.outputs.sift_version }}
+          DOCKERHUB_IMAGE: ${{ needs.discover.outputs.dockerhub_image }}
         run: |
           set -euo pipefail
-          sift_version="${{ needs.discover.outputs.sift_version }}"
-          short_sha="${GITHUB_SHA::12}"
+          # The release tags are the newest upstream release, so the floating
+          # tags move with them.
+          docker buildx imagetools create \
+            --tag "docker.io/${DOCKERHUB_IMAGE}:${SIFT_VERSION}" \
+            --tag "docker.io/${DOCKERHUB_IMAGE}:latest" \
+            "${GHCR_IMAGE}:${SIFT_VERSION}"
+          docker buildx imagetools create \
+            --tag "docker.io/${DOCKERHUB_IMAGE}:${SIFT_VERSION}-desktop" \
+            --tag "docker.io/${DOCKERHUB_IMAGE}:desktop" \
+            "${GHCR_IMAGE}:${SIFT_VERSION}-desktop"
+          for tag in "${SIFT_VERSION}" "${SIFT_VERSION}-desktop"; do
+            ghcr="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${tag}" --format '{{json .Manifest.Digest}}')"
+            hub="$(docker buildx imagetools inspect "docker.io/${DOCKERHUB_IMAGE}:${tag}" --format '{{json .Manifest.Digest}}')"
+            echo "${tag}: ghcr=${ghcr} dockerhub=${hub}"
+            [[ "${ghcr}" == "${hub}" ]] || { echo "Digest mismatch for ${tag}" >&2; exit 1; }
+          done
 
-          tags=(
-            "${GHCR_IMAGE}:latest"
-            "${GHCR_IMAGE}:${sift_version}"
-            "${GHCR_IMAGE}:sha-${short_sha}"
-          )
-
-          if [[ "${PUBLISH_DOCKERHUB}" == "true" ]]; then
-            tags+=(
-              "${DOCKERHUB_IMAGE}:latest"
-              "${DOCKERHUB_IMAGE}:${sift_version}"
-              "${DOCKERHUB_IMAGE}:sha-${short_sha}"
-            )
-          fi
-
-          {
-            echo "tags<<EOF"
-            printf '%s\n' "${tags[@]}"
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Build and publish
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ env.PUBLISH_PLATFORMS }}
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          sbom: true
-          provenance: mode=max
-          build-args: |
-            BASE_IMAGE=${{ env.BASE_IMAGE }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp || '' }}
-            GIT_COMMIT=${{ github.sha }}
-            IMAGE_VERSION=${{ needs.discover.outputs.sift_version }}
-            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
-            IMAGE_DOCUMENTATION=${{ github.server_url }}/${{ github.repository }}#readme
-            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
-            IMAGE_AUTHORS=${{ github.repository_owner }}
-            CAST_VERSION=${{ env.CAST_VERSION }}
-            SIFT_VERSION=${{ needs.discover.outputs.sift_version }}
-            SIFT_TARGET=sift
-            SIFT_MODE=server
-            RUN_VALIDATION=true
+  publish:
+    name: Build and publish
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      sift_version: ${{ needs.discover.outputs.sift_version }}
+      cast_version: ${{ needs.discover.outputs.cast_version }}
+      ubuntu_version: ${{ needs.discover.outputs.ubuntu_version }}
+      platforms: ${{ needs.discover.outputs.platforms }}
+      publish_ghcr: true
+      publish_dockerhub: ${{ needs.discover.outputs.publish_dockerhub == 'true' }}
+      dockerhub_image: ${{ needs.discover.outputs.dockerhub_image }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

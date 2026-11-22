@@ -1,38 +1,34 @@
-ARG BASE_IMAGE=ubuntu:24.04
-FROM ${BASE_IMAGE}
+#
+# Stages:
+#   sift     Ubuntu + SIFT installed by Cast (slow; the expensive layer)
+#   runtime  Per-container hardening + entrypoint shared by all variants
+#   desktop  runtime + Ubuntu GNOME desktop over xrdp (RDP on port 3389)
+#   server   runtime only (SSH on port 22). Default target (last stage).
+#
+# Build a variant with --target server|desktop (scripts/build.sh TARGET=...).
 
-ARG BASE_IMAGE
-ARG BUILD_DATE
-ARG GIT_COMMIT
-ARG IMAGE_VERSION=dev
-ARG IMAGE_SOURCE="https://github.com/xboarder56/sift-workstation-docker"
-ARG IMAGE_DOCUMENTATION="https://github.com/xboarder56/sift-workstation-docker#readme"
-ARG IMAGE_URL="https://github.com/xboarder56/sift-workstation-docker"
-ARG IMAGE_AUTHORS="xboarder56"
+ARG BASE_IMAGE=ubuntu:24.04
+
+#############################################################################
+FROM ${BASE_IMAGE} AS sift
+
 ARG TARGETARCH
-ARG CAST_VERSION=1.0.13
+# Cast release. The pinned version's .deb sha256s are pinned below; any other
+# version is verified against that release's checksums.txt.
+ARG CAST_VERSION=1.0.42
+ARG CAST_PINNED_VERSION=1.0.42
+ARG CAST_SHA256_AMD64=9775d46a42f77030407cd3ba37d5f32334d50e0d4b021ece113c23cbea2c7573
+ARG CAST_SHA256_ARM64=b527fd8592af2520ddd3457cba9538c7e80013b8c58174ab402ac69c03a0c369
 ARG SIFT_VERSION=latest
+# The SIFT Salt states download from many third-party sites; a transient
+# outage of any one (e.g. exiftool.org) fails the run. Salt is idempotent,
+# so retrying only redoes the unfinished work.
+ARG CAST_INSTALL_ATTEMPTS=3
 ARG SIFT_TARGET=sift
 ARG SIFT_MODE=server
 ARG SIFT_USER=sansforensics
 ARG SIFT_DESCRIPTION="SANSForensics User"
 ARG SIFT_PASS=forensics
-ARG RUN_VALIDATION=false
-
-LABEL org.opencontainers.image.title="SIFT Workstation Docker"
-LABEL org.opencontainers.image.description="SANS SIFT Workstation-style container image"
-LABEL org.opencontainers.image.source="${IMAGE_SOURCE}"
-LABEL org.opencontainers.image.documentation="${IMAGE_DOCUMENTATION}"
-LABEL org.opencontainers.image.url="${IMAGE_URL}"
-LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
-LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
-LABEL org.opencontainers.image.created="${BUILD_DATE}"
-LABEL org.opencontainers.image.base.name="${BASE_IMAGE}"
-LABEL org.opencontainers.image.authors="${IMAGE_AUTHORS}"
-LABEL org.opencontainers.image.vendor="xboarder56"
-LABEL org.sans.sift.version="${SIFT_VERSION}"
-LABEL org.sans.sift.cast.version="${CAST_VERSION}"
-LABEL org.sans.sift.install.mode="${SIFT_MODE}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -45,10 +41,21 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 USER root
 WORKDIR /tmp
 
-RUN set -eux; \
+# Optional BuildKit secret `github_token`: Cast queries the GitHub API for
+# SIFT releases, and unauthenticated calls from shared CI runners hit the
+# 60/hour limit (HTTP 403). The secret is never written to a layer.
+RUN --mount=type=secret,id=github_token \
+    set -eux; \
+    if [[ -s /run/secrets/github_token ]]; then \
+        set +x; \
+        CAST_GITHUB_TOKEN="$(cat /run/secrets/github_token)"; \
+        export CAST_GITHUB_TOKEN; \
+        set -x; \
+        echo "Using an authenticated GitHub client for Cast"; \
+    fi; \
     case "${TARGETARCH:-amd64}" in \
-        amd64) cast_arch="amd64" ;; \
-        arm64) cast_arch="arm64" ;; \
+        amd64) cast_arch="amd64"; pinned_sha="${CAST_SHA256_AMD64}" ;; \
+        arm64) cast_arch="arm64"; pinned_sha="${CAST_SHA256_ARM64}" ;; \
         *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     apt-get update; \
@@ -97,13 +104,33 @@ RUN set -eux; \
     echo "${SIFT_USER} ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/sift-user; \
     chmod 0440 /etc/sudoers.d/sift-user; \
     cast_deb="cast-v${CAST_VERSION}-linux-${cast_arch}.deb"; \
-    wget -q "https://github.com/ekristen/cast/releases/download/v${CAST_VERSION}/${cast_deb}"; \
+    cast_base="https://github.com/ekristen/cast/releases/download/v${CAST_VERSION}"; \
+    curl -fsSL --retry 3 --retry-delay 2 -o "${cast_deb}" "${cast_base}/${cast_deb}"; \
+    if [[ "${CAST_VERSION}" == "${CAST_PINNED_VERSION}" ]]; then \
+        expected_sha="${pinned_sha}"; \
+    else \
+        curl -fsSL --retry 3 --retry-delay 2 -o cast-checksums.txt "${cast_base}/checksums.txt"; \
+        expected_sha="$(awk -v f="${cast_deb}" '$2 == f { print $1 }' cast-checksums.txt)"; \
+        rm -f cast-checksums.txt; \
+    fi; \
+    if [[ -z "${expected_sha}" ]]; then \
+        echo "FATAL: no sha256 available for ${cast_deb}" >&2; exit 1; \
+    fi; \
+    echo "${expected_sha}  ${cast_deb}" | sha256sum -c -; \
     apt-get install -y "./${cast_deb}"; \
     sift_spec="${SIFT_TARGET}"; \
     if [[ -n "${SIFT_VERSION}" && "${SIFT_VERSION}" != "latest" ]]; then \
         sift_spec="${SIFT_TARGET}@${SIFT_VERSION}"; \
     fi; \
-    cast install --mode "${SIFT_MODE}" --user "${SIFT_USER}" "${sift_spec}"; \
+    attempt=1; \
+    until cast install --mode "${SIFT_MODE}" --user "${SIFT_USER}" "${sift_spec}"; do \
+        if (( attempt >= CAST_INSTALL_ATTEMPTS )); then \
+            echo "FATAL: cast install failed after ${attempt} attempts" >&2; exit 1; \
+        fi; \
+        echo "cast install attempt ${attempt} failed; retrying in $(( attempt * 60 ))s" >&2; \
+        sleep $(( attempt * 60 )); \
+        attempt=$(( attempt + 1 )); \
+    done; \
     rm -f "./${cast_deb}"
 
 RUN set -eux; \
@@ -124,16 +151,181 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /srv /var/cache/salt/* /root/.cache/* /var/lib/apt/lists/* /tmp/*
 
-COPY validation/ /opt/dfir/validation/
-RUN chmod +x /opt/dfir/validation/*.sh
-RUN if [[ "${RUN_VALIDATION}" == "true" ]]; then \
-        /opt/dfir/validation/validate-container.sh; \
-    else \
-        echo "Skipping build-time validation (RUN_VALIDATION=${RUN_VALIDATION})"; \
-    fi
+#############################################################################
+FROM sift AS runtime
+
+ARG BASE_IMAGE
+ARG BUILD_DATE
+ARG GIT_COMMIT
+ARG IMAGE_VERSION=dev
+ARG IMAGE_SOURCE="https://github.com/xboarder56/sift-workstation-docker"
+ARG IMAGE_DOCUMENTATION="https://github.com/xboarder56/sift-workstation-docker#readme"
+ARG IMAGE_URL="https://github.com/xboarder56/sift-workstation-docker"
+ARG IMAGE_AUTHORS="xboarder56"
+ARG CAST_VERSION=1.0.42
+ARG SIFT_VERSION=latest
+ARG SIFT_MODE=server
+ARG SIFT_USER=sansforensics
+
+LABEL org.opencontainers.image.title="SIFT Workstation Docker" \
+      org.opencontainers.image.description="SANS SIFT Workstation-style container image" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.documentation="${IMAGE_DOCUMENTATION}" \
+      org.opencontainers.image.url="${IMAGE_URL}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      org.opencontainers.image.authors="${IMAGE_AUTHORS}" \
+      org.opencontainers.image.vendor="xboarder56" \
+      org.sans.sift.version="${SIFT_VERSION}" \
+      org.sans.sift.cast.version="${CAST_VERSION}" \
+      org.sans.sift.install.mode="${SIFT_MODE}"
+
+# TINI_SUBREAPER keeps tini quiet when Docker's --init / compose `init: true`
+# makes it a child of docker-init instead of PID 1.
+ENV SIFT_USER=${SIFT_USER} \
+    TINI_SUBREAPER=1
+
+# tini reaps zombies and forwards signals for the multi-service entrypoint.
+# Host keys generated by openssh-server at build time (and any snakeoil TLS
+# key) would be shared by every container from this public image, so remove
+# them here; the entrypoint creates unique ones per container on start.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tini; \
+    rm -f /etc/ssh/ssh_host_*; \
+    rm -f /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem; \
+    : > /etc/machine-id; \
+    rm -f /var/lib/dbus/machine-id; \
+    mkdir -p /etc/ssh/sshd_config.d; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy individual files: copying a directory tree onto / would also apply the
+# source directories' permissions to /etc, /usr, ... (e.g. 0700 checkouts).
+COPY --chmod=0755 rootfs/usr/local/bin/sift-entrypoint /usr/local/bin/sift-entrypoint
+COPY --chmod=0755 validation/validate-container.sh /opt/dfir/validation/validate-container.sh
 
 WORKDIR /home/${SIFT_USER}
 VOLUME ["/case", "/evidence"]
 EXPOSE 22
 
-CMD ["/usr/sbin/sshd", "-D"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sift-entrypoint"]
+CMD ["sift-services"]
+
+#############################################################################
+FROM runtime AS desktop
+
+ARG RUN_VALIDATION=false
+ARG SIFT_VERSION=latest
+
+# GNOME without systemd: /run/systemd/seats (left behind by package installs)
+# makes GNOME Shell require logind, so it is removed; and the `sift` session
+# is the Ubuntu session minus gsd-power, which cannot run without logind.
+# Ubuntu GNOME desktop (the same session a stock SIFT Workstation uses)
+# served over RDP by xrdp + xorgxrdp. Connect with any RDP client (mstsc,
+# Windows App, Remmina, FreeRDP) as the SIFT user. SIFT's theme (wallpaper,
+# bottom dock, favorites) is applied as dconf system defaults.
+# The SIFT install also ships autostart entries that misbehave in a remote
+# session (screen magnifier/reader/on-screen keyboard popping up, a
+# screensaver locking idle sessions); they are hidden for this image.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        xrdp \
+        xorgxrdp \
+        ubuntu-session \
+        gnome-shell \
+        gnome-shell-extension-ubuntu-dock \
+        gnome-shell-extension-appindicator \
+        gnome-session-bin \
+        gnome-settings-daemon \
+        gnome-terminal \
+        nautilus \
+        gnome-text-editor \
+        gnome-system-monitor \
+        eog \
+        evince \
+        yaru-theme-gtk \
+        yaru-theme-icon \
+        yaru-theme-gnome-shell \
+        yaru-theme-sound \
+        fonts-ubuntu \
+        fonts-dejavu-core \
+        dconf-cli \
+        dbus-x11 \
+        dbus-user-session \
+        at-spi2-core \
+        libgl1-mesa-dri \
+        xauth \
+        x11-xserver-utils \
+        xdg-utils \
+        xdg-user-dirs \
+        polkitd \
+        openssl; \
+    adduser xrdp ssl-cert; \
+    rm -f /etc/xrdp/cert.pem /etc/xrdp/key.pem /etc/xrdp/rsakeys.ini \
+          /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem; \
+    sift_ref="${SIFT_VERSION}"; \
+    if [[ -z "${sift_ref}" || "${sift_ref}" == "latest" ]]; then sift_ref=master; fi; \
+    mkdir -p /usr/share/backgrounds; \
+    curl -fsSL --retry 3 --retry-delay 2 -o /usr/share/backgrounds/sift.png \
+        "https://raw.githubusercontent.com/teamdfir/sift-saltstack/${sift_ref}/sift/files/sift/images/sift.png"; \
+    file /usr/share/backgrounds/sift.png | grep -q 'PNG image'; \
+    for entry in magnus-autostart onboard-autostart orca-autostart xscreensaver \
+                 snap-userd-autostart unity-settings-daemon unity-fallback-mount-helper \
+                 indicator-application indicator-messages geoclue-demo-agent \
+                 org.gnome.Evolution-alarm-notify gnome-initial-setup-first-login \
+                 gnome-initial-setup-copy-worker update-notifier tracker-miner-fs-3; do \
+        f="/etc/xdg/autostart/${entry}.desktop"; \
+        if [[ -f "${f}" ]]; then \
+            sed -i '/^Hidden=/d' "${f}"; \
+            sed -i '0,/^\[Desktop Entry\]/s//[Desktop Entry]\nHidden=true/' "${f}"; \
+        fi; \
+    done; \
+    sed -e 's/^Name=Ubuntu$/Name=SIFT (Ubuntu GNOME over RDP)/' \
+        -e 's/org\.gnome\.SettingsDaemon\.Power;//' \
+        /usr/share/gnome-session/sessions/ubuntu.session \
+        > /usr/share/gnome-session/sessions/sift.session; \
+    rm -rf /run/systemd/seats /run/systemd/sessions; \
+    printf '%s\n' 'allowed_users=anybody' 'needs_root_rights=no' > /etc/X11/Xwrapper.config; \
+    sed -i -E 's/^#?\s*security_layer=.*/security_layer=tls/' /etc/xrdp/xrdp.ini; \
+    awk 'BEGIN { drop = 0 } \
+         /^\[/ { drop = ($0 == "[Xvnc]" || $0 == "[vnc-any]" || $0 == "[neutrinordp-any]") } \
+         !drop' /etc/xrdp/xrdp.ini > /tmp/xrdp.ini; \
+    mv /tmp/xrdp.ini /etc/xrdp/xrdp.ini; \
+    chmod 0644 /etc/xrdp/xrdp.ini; \
+    echo desktop > /etc/sift-image-variant; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /tmp/*
+
+COPY --chmod=0755 rootfs-desktop/etc/xrdp/startwm.sh /etc/xrdp/startwm.sh
+COPY --chmod=0644 rootfs-desktop/etc/dconf/profile/user /etc/dconf/profile/user
+COPY --chmod=0644 rootfs-desktop/etc/dconf/db/local.d/00-sift /etc/dconf/db/local.d/00-sift
+COPY --chmod=0644 rootfs-desktop/etc/polkit-1/rules.d/50-sift-xrdp.rules /etc/polkit-1/rules.d/50-sift-xrdp.rules
+RUN set -eux; \
+    dconf update; \
+    if [[ "${RUN_VALIDATION}" == "true" ]]; then \
+        SIFT_VALIDATE_IMAGE_STATE=true /opt/dfir/validation/validate-container.sh; \
+    else \
+        echo "Skipping build-time validation (RUN_VALIDATION=${RUN_VALIDATION})"; \
+    fi
+
+LABEL org.sans.sift.image.variant="desktop"
+EXPOSE 3389
+
+#############################################################################
+# Default target: SSH-only server image.
+FROM runtime AS server
+
+ARG RUN_VALIDATION=false
+
+RUN echo server > /etc/sift-image-variant; \
+    if [[ "${RUN_VALIDATION}" == "true" ]]; then \
+        SIFT_VALIDATE_IMAGE_STATE=true /opt/dfir/validation/validate-container.sh; \
+    else \
+        echo "Skipping build-time validation (RUN_VALIDATION=${RUN_VALIDATION})"; \
+    fi
+
+LABEL org.sans.sift.image.variant="server"

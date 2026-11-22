@@ -1,0 +1,10 @@
+// Remote (xrdp) GNOME sessions are not "active local" sessions, so GNOME's
+// colord and NetworkManager checks would show repeated authentication
+// prompts at login. Allow the SIFT user's sessions to proceed silently.
+polkit.addRule(function(action, subject) {
+  if ((action.id.indexOf("org.freedesktop.color-manager.") === 0 ||
+       action.id.indexOf("org.freedesktop.NetworkManager.") === 0) &&
+      subject.isInGroup("sudo")) {
+    return polkit.Result.YES;
+  }
+});

@@ -9,7 +9,13 @@ IMAGE_TAG="${IMAGE_TAG:-dev}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-24.04}"
 BASE_IMAGE="${BASE_IMAGE:-ubuntu:${UBUNTU_VERSION}}"
 PLATFORMS="${PLATFORMS:-linux/amd64}"
-CAST_VERSION="${CAST_VERSION:-1.0.13}"
+CAST_VERSION="${CAST_VERSION:-1.0.42}"
+# server (SSH only, default) or desktop (adds Ubuntu GNOME over xrdp/RDP).
+TARGET="${TARGET:-server}"
+# Optional: reuse an existing SIFT image as the slow `sift` stage, e.g.
+#   SIFT_STAGE_IMAGE=ghcr.io/xboarder56/sift-workstation:v2026.10.19
+# Iterates on the runtime/desktop layers without re-running Cast.
+SIFT_STAGE_IMAGE="${SIFT_STAGE_IMAGE:-}"
 IMAGE_VERSION="${IMAGE_VERSION:-${IMAGE_TAG}}"
 GIT_COMMIT="${GIT_COMMIT:-$(git -C "${CONTEXT_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
@@ -25,9 +31,15 @@ NO_CACHE="${NO_CACHE:-false}"
 PROGRESS="${PROGRESS:-auto}"
 DRY_RUN="${DRY_RUN:-false}"
 
+case "${TARGET}" in
+  server|desktop) ;;
+  *) echo "TARGET must be server or desktop (got: ${TARGET})" >&2; exit 2 ;;
+esac
+
 args=(
   docker buildx build
   --file "${CONTEXT_DIR}/Dockerfile"
+  --target "${TARGET}"
   --platform "${PLATFORMS}"
   --progress "${PROGRESS}"
   --build-arg "BASE_IMAGE=${BASE_IMAGE}"
@@ -46,6 +58,18 @@ args=(
   --tag "${IMAGE_NAME}:${IMAGE_TAG}"
 )
 
+# Authenticate Cast's GitHub API calls (BuildKit secret; not stored in the
+# image) to avoid the unauthenticated rate limit.
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  args+=(--secret "id=github_token,env=GITHUB_TOKEN")
+elif [[ -n "${GH_TOKEN:-}" ]]; then
+  args+=(--secret "id=github_token,env=GH_TOKEN")
+fi
+
+if [[ -n "${SIFT_STAGE_IMAGE}" ]]; then
+  args+=(--build-context "sift=docker-image://${SIFT_STAGE_IMAGE}")
+fi
+
 if [[ "${NO_CACHE}" == "true" ]]; then
   args+=(--no-cache)
 fi
@@ -53,6 +77,7 @@ fi
 if [[ "${PUSH:-false}" == "true" ]]; then
   args+=(--push)
 elif [[ "${LOAD:-true}" == "true" ]]; then
+  # Needed for docker-container builders; harmless with the default driver.
   args+=(--load)
 fi
 

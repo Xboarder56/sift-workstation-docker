@@ -2,6 +2,11 @@
 set -euo pipefail
 
 SIFT_USER="${SIFT_USER:-sansforensics}"
+SIFT_VARIANT="${SIFT_VARIANT:-$(cat /etc/sift-image-variant 2>/dev/null || echo unknown)}"
+# Set to true when validating the image filesystem itself (build time / fresh
+# `docker run --rm IMAGE validate-container.sh`), not a running container
+# whose entrypoint has already created per-container secrets.
+SIFT_VALIDATE_IMAGE_STATE="${SIFT_VALIDATE_IMAGE_STATE:-false}"
 
 failures=()
 
@@ -38,6 +43,10 @@ require_command cast
 require_command sshd
 require_command sudo
 require_command python3
+require_command tini
+require_command ssh-keygen
+
+require_path /usr/local/bin/sift-entrypoint
 
 require_dir "/home/${SIFT_USER}"
 require_dir /case
@@ -87,6 +96,65 @@ if [[ -d "/home/${SIFT_USER}" ]]; then
   fi
 fi
 
+if [[ "${SIFT_VALIDATE_IMAGE_STATE}" == "true" ]]; then
+  # Per-container secrets must never be baked into the published image.
+  for key in /etc/ssh/ssh_host_*_key /etc/xrdp/key.pem /etc/xrdp/rsakeys.ini \
+             /etc/ssl/private/ssl-cert-snakeoil.key; do
+    if [[ -e "${key}" ]]; then
+      failures+=("image contains a shared private key: ${key}")
+    fi
+  done
+  if [[ -s /etc/machine-id || -e /var/lib/dbus/machine-id ]]; then
+    failures+=("image contains a baked machine-id (would be shared by every container)")
+  fi
+fi
+
+case "${SIFT_VARIANT}" in
+  server) ;;
+  desktop)
+    require_command xrdp
+    require_command xrdp-sesman
+    require_command gnome-session
+    require_command gnome-shell
+    require_command gnome-terminal
+    require_command nautilus
+    require_command dbus-daemon
+    require_path /usr/lib/xorg/modules/libxorgxrdp.so
+    require_path /etc/xrdp/startwm.sh
+    require_path /usr/share/gnome-session/sessions/sift.session
+    if grep -q 'SettingsDaemon.Power' /usr/share/gnome-session/sessions/sift.session 2>/dev/null; then
+      failures+=("sift GNOME session still requires gsd-power (needs logind)")
+    fi
+    if [[ -e /run/systemd/seats ]]; then
+      failures+=("/run/systemd/seats exists; GNOME Shell would require logind")
+    fi
+    require_path /usr/share/backgrounds/sift.png
+    require_path /etc/dconf/db/local
+    if [[ -e /etc/xrdp/startwm.sh ]] && ! grep -q 'gnome-session --session=sift' /etc/xrdp/startwm.sh; then
+      failures+=("xrdp startwm.sh does not start the Ubuntu GNOME session")
+    fi
+    if ! grep -qx 'allowed_users=anybody' /etc/X11/Xwrapper.config 2>/dev/null; then
+      failures+=("Xwrapper.config does not allow xrdp Xorg sessions")
+    fi
+    for entry in magnus-autostart orca-autostart onboard-autostart xscreensaver; do
+      f="/etc/xdg/autostart/${entry}.desktop"
+      if [[ -f "${f}" ]] && ! grep -qx 'Hidden=true' "${f}"; then
+        failures+=("desktop autostart entry is not hidden: ${f}")
+      fi
+    done
+    if grep -qE '^\[(Xvnc|vnc-any|neutrinordp-any)\]' /etc/xrdp/xrdp.ini 2>/dev/null; then
+      failures+=("xrdp.ini still offers proxy/VNC sessions (vnc-any/neutrinordp-any/Xvnc)")
+    fi
+    if ! grep -qx 'security_layer=tls' /etc/xrdp/xrdp.ini 2>/dev/null; then
+      failures+=("xrdp.ini does not enforce TLS (security_layer=tls)")
+    fi
+    if ! id -nG xrdp 2>/dev/null | grep -qw ssl-cert; then
+      failures+=("xrdp user is not in the ssl-cert group")
+    fi
+    ;;
+  *) failures+=("unknown image variant: ${SIFT_VARIANT}") ;;
+esac
+
 if (( ${#failures[@]} > 0 )); then
   printf 'Container contract validation failed:\n' >&2
   printf '  - %s\n' "${failures[@]}" >&2
@@ -97,6 +165,7 @@ echo "Container contract validation passed."
 echo "Checked Docker-layer additions only; SIFT tool validation is owned by Cast/Salt."
 echo
 echo "Runtime probes:"
+printf '  - variant: %s\n' "${SIFT_VARIANT}"
 printf '  - user: '
 id "${SIFT_USER}"
 printf '  - cast: '
@@ -104,4 +173,13 @@ cast --version
 printf '  - python: '
 python3 --version
 printf '  - sshd: '
-sshd -T | awk '/^port / { print }'
+# sshd -T needs host keys; probe with a throwaway key so this works on a
+# fresh image without creating persistent keys.
+probe_key="$(mktemp -u)"
+ssh-keygen -q -t ed25519 -N '' -f "${probe_key}"
+sshd -T -h "${probe_key}" | awk '/^port / { print }'
+rm -f "${probe_key}" "${probe_key}.pub"
+if [[ "${SIFT_VARIANT}" == "desktop" ]]; then
+  printf '  - xrdp: '
+  xrdp --version 2>&1 | head -n1
+fi
