@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Entrypoint for sift-workstation-docker. Runs under tini (PID 1).
+#
+#   sift-services (default CMD)  Prepare per-container secrets and run sshd,
+#                                plus xrdp on the desktop image.
+#   anything else                Executed directly, as with earlier images
+#                                (e.g. `bash`, `log2timeline.py ...`).
+#
+# Runtime settings (all optional):
+#   SIFT_PASSWORD / SIFT_PASSWORD_FILE    Set the SIFT user's password.
+#   SIFT_AUTHORIZED_KEYS / _FILE          SSH public keys for the SIFT user.
+#   SIFT_SSH_PASSWORD_AUTH=yes|no         Allow SSH password logins (default yes).
+#   SIFT_ENABLE_SSH=true|false            Run sshd (default true).
+#   SIFT_ENABLE_XRDP=true|false           Run xrdp on the desktop image (default true).
+set -euo pipefail
+
+SIFT_USER="${SIFT_USER:-sansforensics}"
+SIFT_HOME="$(getent passwd "${SIFT_USER}" | cut -d: -f6)"
+SIFT_HOME="${SIFT_HOME:-/home/${SIFT_USER}}"
+
+log() { printf '[sift-entrypoint] %s\n' "$*" >&2; }
+die() { log "FATAL: $*"; exit 1; }
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    0|false|no|off|"") return 1 ;;
+    *) die "expected a boolean (true/false), got: '$1'" ;;
+  esac
+}
+
+# Read VAR or VAR_FILE (Docker/Podman secrets convention) into REPLY.
+read_setting() {
+  local name="$1" file_name="${1}_FILE"
+  local value="${!name:-}" file="${!file_name:-}"
+  REPLY=""
+  if [[ -n "${value}" && -n "${file}" ]]; then
+    die "set either ${name} or ${file_name}, not both"
+  fi
+  if [[ -n "${file}" ]]; then
+    [[ -f "${file}" && -r "${file}" ]] || die "${file_name} is not a readable file: ${file}"
+    value="$(<"${file}")"
+    [[ -n "${value}" ]] || die "${file_name} is empty: ${file}"
+  fi
+  REPLY="${value}"
+}
+
+ensure_ssh_host_keys() {
+  if ! compgen -G '/etc/ssh/ssh_host_*_key' >/dev/null; then
+    log "Generating unique SSH host keys for this container"
+  fi
+  # Creates only the key types that are missing; keeps persisted keys.
+  ssh-keygen -A >/dev/null
+}
+
+configure_ssh() {
+  local password_auth="${SIFT_SSH_PASSWORD_AUTH:-yes}"
+  case "${password_auth,,}" in
+    yes|true) password_auth=yes ;;
+    no|false) password_auth=no ;;
+    *) die "SIFT_SSH_PASSWORD_AUTH must be yes or no, got: '${password_auth}'" ;;
+  esac
+  mkdir -p /etc/ssh/sshd_config.d /run/sshd
+  # Drop-ins are read before the main config and the first value wins.
+  printf '%s\n' \
+    '# Managed by sift-entrypoint on every start.' \
+    "PasswordAuthentication ${password_auth}" \
+    'KbdInteractiveAuthentication no' \
+    'PermitRootLogin no' \
+    > /etc/ssh/sshd_config.d/10-sift.conf
+}
+
+configure_credentials() {
+  read_setting SIFT_PASSWORD
+  local password="${REPLY}"
+  if [[ -n "${password}" ]]; then
+    printf '%s:%s\n' "${SIFT_USER}" "${password}" | chpasswd
+    log "Set password for ${SIFT_USER} from SIFT_PASSWORD"
+  else
+    log "WARNING: ${SIFT_USER} still uses the image default password." \
+        "Set SIFT_PASSWORD or SIFT_PASSWORD_FILE before exposing this container."
+  fi
+  unset SIFT_PASSWORD
+
+  read_setting SIFT_AUTHORIZED_KEYS
+  local keys="${REPLY}"
+  if [[ -n "${keys}" ]]; then
+    install -d -m 0700 -o "${SIFT_USER}" -g "${SIFT_USER}" "${SIFT_HOME}/.ssh"
+    printf '%s\n' "${keys}" > "${SIFT_HOME}/.ssh/authorized_keys"
+    chown "${SIFT_USER}:${SIFT_USER}" "${SIFT_HOME}/.ssh/authorized_keys"
+    chmod 0600 "${SIFT_HOME}/.ssh/authorized_keys"
+    log "Installed SSH authorized_keys for ${SIFT_USER}"
+  fi
+}
+
+ensure_xrdp_tls() {
+  # Unique self-signed TLS identity per container (kept if /etc/xrdp persists).
+  if [[ ! -s /etc/xrdp/key.pem || ! -s /etc/xrdp/cert.pem ]]; then
+    log "Generating unique xrdp TLS certificate for this container"
+    rm -f /etc/xrdp/key.pem /etc/xrdp/cert.pem
+    openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+      -subj "/CN=$(hostname)" \
+      -keyout /etc/xrdp/key.pem -out /etc/xrdp/cert.pem >/dev/null 2>&1
+  fi
+  chown root:xrdp /etc/xrdp/key.pem /etc/xrdp/cert.pem 2>/dev/null || true
+  chmod 0640 /etc/xrdp/key.pem
+  chmod 0644 /etc/xrdp/cert.pem
+}
+
+start_dbus() {
+  mkdir -p /run/dbus
+  rm -f /run/dbus/pid
+  dbus-daemon --system --fork
+}
+
+PIDS=()
+shutdown() {
+  trap - TERM INT
+  log "Stopping services"
+  if ((${#PIDS[@]})); then
+    kill -TERM "${PIDS[@]}" 2>/dev/null || true
+    wait "${PIDS[@]}" 2>/dev/null || true
+  fi
+  exit 0
+}
+
+run_services() {
+  local run_ssh=false run_xrdp=false
+  is_true "${SIFT_ENABLE_SSH:-true}" && run_ssh=true
+  if [[ -x /usr/sbin/xrdp ]] && is_true "${SIFT_ENABLE_XRDP:-true}"; then
+    run_xrdp=true
+  fi
+  [[ "${run_ssh}" == true || "${run_xrdp}" == true ]] || die "no services enabled"
+
+  configure_credentials
+
+  if [[ "${run_ssh}" == true ]]; then
+    ensure_ssh_host_keys
+    configure_ssh
+  fi
+  if [[ "${run_xrdp}" == true ]]; then
+    ensure_xrdp_tls
+    # GNOME Shell assumes logind when this exists; there is no logind here.
+    rm -rf /run/systemd/seats /run/systemd/sessions
+    start_dbus
+    rm -f /var/run/xrdp/*.pid /run/xrdp/*.pid 2>/dev/null || true
+  fi
+
+  trap shutdown TERM INT
+
+  if [[ "${run_xrdp}" == true ]]; then
+    /usr/sbin/xrdp-sesman --nodaemon & PIDS+=("$!")
+    /usr/sbin/xrdp --nodaemon & PIDS+=("$!")
+    log "xrdp listening on port 3389 (RDP)"
+  fi
+  if [[ "${run_ssh}" == true ]]; then
+    /usr/sbin/sshd -D -e & PIDS+=("$!")
+    log "sshd listening on port 22"
+  fi
+
+  # If any service exits, stop the rest so the container restart policy applies.
+  local rc=0
+  wait -n "${PIDS[@]}" || rc=$?
+  log "A service exited (status ${rc}); stopping container"
+  kill -TERM "${PIDS[@]}" 2>/dev/null || true
+  wait "${PIDS[@]}" 2>/dev/null || true
+  exit "$(( rc == 0 ? 1 : rc ))"
+}
+
+if [[ $# -eq 0 || "$1" == "sift-services" ]]; then
+  run_services
+fi
+
+# Backward compatibility: running sshd directly (the previous default CMD).
+case "$1" in
+  sshd|/usr/sbin/sshd) ensure_ssh_host_keys; mkdir -p /run/sshd ;;
+esac
+
+exec "$@"

@@ -1,11 +1,19 @@
 # Example Docker Compose file for running SIFT Workstation as a persistent
-# SSH-accessible container.
+# SSH (and optionally RDP desktop) container.
 #
 # Copy this file to docker-compose.yml before editing:
 #
 #   cp docker-compose.example.yml docker-compose.yml
 #   cp .env.example .env
+#   mkdir -p secrets && printf '%s\n' 'choose-a-strong-password' > secrets/sift_password
 #   docker compose up -d
+#
+# Image variants (SIFT_TAG in .env):
+#   latest   SSH only
+#   desktop  SSH + SIFT GNOME desktop over RDP on port 3389
+#
+# Ports bind to 127.0.0.1 by default. Set SIFT_BIND_ADDRESS=0.0.0.0 only if
+# other machines must connect, and only with a strong password or SSH keys.
 #
 # The service is intentionally privileged because common forensic mounting
 # workflows need FUSE, loop devices, and SYS_ADMIN. For one-shot commands that
@@ -13,7 +21,7 @@
 
 services:
   sift:
-    image: ${SIFT_IMAGE:-sift-workstation}:${SIFT_TAG:-latest}
+    image: ${SIFT_IMAGE:-ghcr.io/xboarder56/sift-workstation}:${SIFT_TAG:-latest}
     container_name: ${SIFT_CONTAINER_NAME:-sift-workstation}
     hostname: ${SIFT_HOSTNAME:-sift-workstation}
     restart: unless-stopped
@@ -25,12 +33,27 @@ services:
     devices:
       - /dev/fuse:/dev/fuse
 
+    # Desktop apps (browsers, GUI viewers) need more than the 64 MB default.
+    shm_size: ${SIFT_SHM_SIZE:-1gb}
+
     environment:
       TZ: ${TZ:-UTC}
       TERM: ${TERM:-xterm-256color}
+      # Password for the sansforensics user (SSH and RDP), read from the
+      # secret below. Without it the image default password is used.
+      SIFT_PASSWORD_FILE: /run/secrets/sift_password
+      # Optional: SSH public keys, and disable SSH password logins.
+      # SIFT_AUTHORIZED_KEYS_FILE: /run/secrets/sift_authorized_keys
+      # SIFT_SSH_PASSWORD_AUTH: "no"
+
+    secrets:
+      - sift_password
+      # - sift_authorized_keys
 
     ports:
-      - "${SIFT_SSH_PORT:-2222}:22"
+      - "${SIFT_BIND_ADDRESS:-127.0.0.1}:${SIFT_SSH_PORT:-2222}:22"
+      # RDP; only answered by the `desktop` image.
+      - "${SIFT_BIND_ADDRESS:-127.0.0.1}:${SIFT_RDP_PORT:-3389}:3389"
 
     volumes:
       # All case directories. Useful for persistent SSH workflows.
@@ -47,6 +70,12 @@ services:
       # Use this form only if you need a stable container IP:
       # sift_net:
       #   ipv4_address: ${SIFT_IPV4:-172.16.0.2}
+
+secrets:
+  sift_password:
+    file: ${SIFT_PASSWORD_SECRET:-./secrets/sift_password}
+  # sift_authorized_keys:
+  #   file: ./secrets/authorized_keys
 
 networks:
   sift_net:

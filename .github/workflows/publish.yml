@@ -1,0 +1,267 @@
+name: Publish (reusable)
+
+# Builds the server and desktop variants natively per architecture, pushes
+# them by digest (untagged) to GHCR, runs the runtime smoke tests against
+# the pushed digests, and only then creates the public multi-arch tags on
+# GHCR and, optionally, Docker Hub.
+
+on:
+  workflow_call:
+    inputs:
+      sift_version:
+        description: "Resolved SIFT release tag (vYYYY.MM.DD)"
+        type: string
+        required: true
+      cast_version:
+        type: string
+        default: "1.0.42"
+      ubuntu_version:
+        type: string
+        default: "24.04"
+      platforms:
+        description: "Comma-separated: linux/amd64,linux/arm64"
+        type: string
+        default: "linux/amd64,linux/arm64"
+      publish_ghcr:
+        type: boolean
+        default: true
+      publish_dockerhub:
+        type: boolean
+        default: false
+      dockerhub_image:
+        type: string
+        default: "xboarder56/sift-workstation"
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_IMAGE: ghcr.io/xboarder56/sift-workstation
+
+jobs:
+  prepare:
+    name: Prepare build matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      build_date: ${{ steps.matrix.outputs.build_date }}
+    steps:
+      - name: Compute matrix and build date
+        id: matrix
+        shell: bash
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          entries=()
+          IFS=',' read -ra plats <<< "${PLATFORMS}"
+          for p in "${plats[@]}"; do
+            p="$(echo "$p" | xargs)"
+            case "$p" in
+              linux/amd64) entries+=("{\"platform\":\"linux/amd64\",\"arch\":\"amd64\",\"runner\":\"ubuntu-24.04\"}") ;;
+              linux/arm64) entries+=("{\"platform\":\"linux/arm64\",\"arch\":\"arm64\",\"runner\":\"ubuntu-24.04-arm\"}") ;;
+              *) echo "Unsupported platform: $p" >&2; exit 1 ;;
+            esac
+          done
+          (IFS=','; echo "matrix={\"include\":[${entries[*]}]}") >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        continue-on-error: true
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push server (by digest)
+        id: server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: server
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            BASE_IMAGE=ubuntu:${{ inputs.ubuntu_version }}
+            BUILD_DATE=${{ needs.prepare.outputs.build_date }}
+            GIT_COMMIT=${{ github.sha }}
+            IMAGE_VERSION=${{ inputs.sift_version }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_DOCUMENTATION=${{ github.server_url }}/${{ github.repository }}#readme
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_AUTHORS=${{ github.repository_owner }}
+            CAST_VERSION=${{ inputs.cast_version }}
+            SIFT_VERSION=${{ inputs.sift_version }}
+            SIFT_TARGET=sift
+            SIFT_MODE=server
+            RUN_VALIDATION=true
+
+      - name: Build and push desktop (by digest)
+        id: desktop
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: desktop
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            BASE_IMAGE=ubuntu:${{ inputs.ubuntu_version }}
+            BUILD_DATE=${{ needs.prepare.outputs.build_date }}
+            GIT_COMMIT=${{ github.sha }}
+            IMAGE_VERSION=${{ inputs.sift_version }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_DOCUMENTATION=${{ github.server_url }}/${{ github.repository }}#readme
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_AUTHORS=${{ github.repository_owner }}
+            CAST_VERSION=${{ inputs.cast_version }}
+            SIFT_VERSION=${{ inputs.sift_version }}
+            SIFT_TARGET=sift
+            SIFT_MODE=server
+            RUN_VALIDATION=true
+
+      - name: Record digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          echo "${{ steps.server.outputs.digest }}" > "digests/server-${{ matrix.arch }}"
+          echo "${{ steps.desktop.outputs.digest }}" > "digests/desktop-${{ matrix.arch }}"
+          cat digests/*
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/*
+          retention-days: 3
+
+      - name: Free builder cache before smoke tests
+        run: |
+          docker buildx prune --all --force || true
+          df -h /
+
+      - name: Smoke test server
+        run: |
+          docker pull "${GHCR_IMAGE}@${{ steps.server.outputs.digest }}"
+          ./scripts/smoke-test.sh "${GHCR_IMAGE}@${{ steps.server.outputs.digest }}" server
+
+      - name: Smoke test desktop
+        env:
+          SMOKE_OUT_DIR: ${{ runner.temp }}/smoke
+        run: |
+          docker pull "${GHCR_IMAGE}@${{ steps.desktop.outputs.digest }}"
+          ./scripts/smoke-test.sh "${GHCR_IMAGE}@${{ steps.desktop.outputs.digest }}" desktop
+
+      - name: Upload RDP screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-screenshot-${{ matrix.arch }}
+          path: ${{ runner.temp }}/smoke/*.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+  tag:
+    name: Create multi-arch tags
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: inputs.publish_dockerhub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push tags
+        shell: bash
+        env:
+          SIFT_VERSION: ${{ inputs.sift_version }}
+          PUBLISH_GHCR: ${{ inputs.publish_ghcr }}
+          PUBLISH_DOCKERHUB: ${{ inputs.publish_dockerhub }}
+          DOCKERHUB_IMAGE: ${{ inputs.dockerhub_image }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          ls -la digests
+
+          for variant in server desktop; do
+            sources=()
+            for f in digests/"${variant}"-*; do
+              sources+=("${GHCR_IMAGE}@$(cat "$f")")
+            done
+            if [[ "$variant" == server ]]; then
+              suffixes=("latest" "${SIFT_VERSION}" "sha-${short_sha}")
+            else
+              suffixes=("desktop" "${SIFT_VERSION}-desktop" "sha-${short_sha}-desktop")
+            fi
+
+            registries=()
+            [[ "$PUBLISH_GHCR" == "true" ]] && registries+=("${GHCR_IMAGE}")
+            [[ "$PUBLISH_DOCKERHUB" == "true" ]] && registries+=("docker.io/${DOCKERHUB_IMAGE}")
+
+            for registry in "${registries[@]}"; do
+              args=()
+              for s in "${suffixes[@]}"; do args+=(--tag "${registry}:${s}"); done
+              echo "::group::${variant} -> ${registry}"
+              docker buildx imagetools create "${args[@]}" "${sources[@]}"
+              docker buildx imagetools inspect "${registry}:${suffixes[1]}"
+              echo "::endgroup::"
+            done
+          done

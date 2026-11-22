@@ -1,0 +1,29 @@
+# System defaults for the SIFT desktop (users can still change them).
+# Mirrors the upstream SIFT theme state (sift/config/user/theme.sls).
+
+[org/gnome/desktop/background]
+picture-uri='file:///usr/share/backgrounds/sift.png'
+picture-uri-dark='file:///usr/share/backgrounds/sift.png'
+picture-options='zoom'
+
+[org/gnome/shell/extensions/dash-to-dock]
+dock-position='BOTTOM'
+
+[org/gnome/shell]
+favorite-apps=['org.gnome.Terminal.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.TextEditor.desktop']
+welcome-dialog-last-shown-version='999'
+
+# Remote sessions: no screen lock/blanking (xrdp handles reconnects), and no
+# lock-on-suspend in a container that never suspends.
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+idle-activation-enabled=false
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/desktop/lockdown]
+disable-lock-screen=true
+
+[org/gnome/desktop/interface]
+enable-animations=false
