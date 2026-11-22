@@ -58,6 +58,14 @@ args=(
   --tag "${IMAGE_NAME}:${IMAGE_TAG}"
 )
 
+# Authenticate Cast's GitHub API calls (BuildKit secret; not stored in the
+# image) to avoid the unauthenticated rate limit.
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  args+=(--secret "id=github_token,env=GITHUB_TOKEN")
+elif [[ -n "${GH_TOKEN:-}" ]]; then
+  args+=(--secret "id=github_token,env=GH_TOKEN")
+fi
+
 if [[ -n "${SIFT_STAGE_IMAGE}" ]]; then
   args+=(--build-context "sift=docker-image://${SIFT_STAGE_IMAGE}")
 fi

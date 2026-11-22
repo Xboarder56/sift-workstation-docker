@@ -41,7 +41,18 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 USER root
 WORKDIR /tmp
 
-RUN set -eux; \
+# Optional BuildKit secret `github_token`: Cast queries the GitHub API for
+# SIFT releases, and unauthenticated calls from shared CI runners hit the
+# 60/hour limit (HTTP 403). The secret is never written to a layer.
+RUN --mount=type=secret,id=github_token \
+    set -eux; \
+    if [[ -s /run/secrets/github_token ]]; then \
+        set +x; \
+        CAST_GITHUB_TOKEN="$(cat /run/secrets/github_token)"; \
+        export CAST_GITHUB_TOKEN; \
+        set -x; \
+        echo "Using an authenticated GitHub client for Cast"; \
+    fi; \
     case "${TARGETARCH:-amd64}" in \
         amd64) cast_arch="amd64"; pinned_sha="${CAST_SHA256_AMD64}" ;; \
         arm64) cast_arch="arm64"; pinned_sha="${CAST_SHA256_ARM64}" ;; \

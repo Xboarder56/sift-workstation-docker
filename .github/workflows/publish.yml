@@ -137,6 +137,8 @@ jobs:
           # In-image SBOM attestations are capped at 80 MB by BuildKit and the
           # desktop SBOM exceeds that; SBOMs are generated below with Syft.
           sbom: false
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
           provenance: mode=max
           build-args: |
             BASE_IMAGE=ubuntu:${{ inputs.ubuntu_version }}
@@ -165,6 +167,8 @@ jobs:
           # In-image SBOM attestations are capped at 80 MB by BuildKit and the
           # desktop SBOM exceeds that; SBOMs are generated below with Syft.
           sbom: false
+          secrets: |
+            github_token=${{ secrets.GITHUB_TOKEN }}
           provenance: mode=max
           build-args: |
             BASE_IMAGE=ubuntu:${{ inputs.ubuntu_version }}
