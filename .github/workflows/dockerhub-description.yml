@@ -1,0 +1,69 @@
+name: dockerhub-description
+
+# Keep the Docker Hub page in sync with the README. Docker Hub gets the
+# user-facing part of README.md (scripts/dockerhub-readme.sh): everything up
+# to "Building from source", which stays on GitHub, plus a footer linking to
+# the full documentation. Generated rather than copied, so Hub stays as
+# detailed as the README and can't drift from it.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - README.md
+      - scripts/dockerhub-readme.sh
+      - .github/workflows/dockerhub-description.yml
+  pull_request:
+    paths:
+      - README.md
+      - scripts/dockerhub-readme.sh
+      - .github/workflows/dockerhub-description.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-description
+  cancel-in-progress: true
+
+env:
+  DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'xboarder56/sift-workstation' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Generate the Docker Hub page and check its limits
+        run: |
+          set -euo pipefail
+          scripts/dockerhub-readme.sh > "$RUNNER_TEMP/dockerhub.md"
+          bytes="$(wc -c < "$RUNNER_TEMP/dockerhub.md")"
+          echo "Docker Hub description: ${bytes} bytes (limit 25000)"
+          [ "$bytes" -le 25000 ] || { echo "::error::Docker Hub description is ${bytes} bytes, over the 25,000-byte limit"; exit 1; }
+          # Docker Hub can't resolve repository-relative links.
+          if grep -nE '\]\((\./|\.\./|[A-Za-z0-9_.-]+\.(md|ya?ml|sh)([#)]))' "$RUNNER_TEMP/dockerhub.md"; then
+            echo "::error::relative links above would break on Docker Hub; use absolute URLs in that part of README.md"
+            exit 1
+          fi
+          {
+            echo "### Docker Hub description (${bytes} bytes)"
+            echo
+            grep -E '^#{1,3} ' "$RUNNER_TEMP/dockerhub.md" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only from main, and only when Docker Hub publishing is enabled (the same
+      # PUBLISH_DOCKERHUB variable the release workflows use). Needs a Docker Hub
+      # token with read/write/delete scope.
+      - name: Update the Docker Hub description
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_DOCKERHUB == 'true'
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE }}
+          readme-filepath: ${{ runner.temp }}/dockerhub.md
+          short-description: "SANS SIFT Workstation in Docker: server + GNOME desktop over RDP, amd64/arm64"

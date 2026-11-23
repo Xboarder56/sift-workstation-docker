@@ -307,7 +307,7 @@ is verified against that Cast release's `checksums.txt`.
 
 ### GitHub Actions
 
-Three workflows live in `.github/workflows/`:
+Four workflows live in `.github/workflows/`:
 
 - **`build.yml`** builds the server and desktop images on amd64 for every
   push and PR. It runs the image validation and the SSH/RDP smoke tests,
@@ -327,6 +327,14 @@ Three workflows live in `.github/workflows/`:
   `ubuntu-24.04-arm`), with no QEMU emulation. Images are pushed untagged by
   digest and smoke-tested from the registry. The public multi-arch tags are
   created only after every architecture and variant passes.
+- **`dockerhub-description.yml`** keeps the Docker Hub page in sync with this
+  README. `scripts/dockerhub-readme.sh` takes the user-facing part (everything
+  above "Building from source") and adds a footer linking back here. The
+  workflow checks Docker Hub's 25,000-byte limit and rejects repository-relative
+  links, which Hub can't resolve, on every PR that touches the README. It
+  updates Docker Hub on `main` when `PUBLISH_DOCKERHUB=true`, which needs a token
+  with read/write/delete scope. Preview locally with
+  `scripts/dockerhub-readme.sh`. Keep that part of the README to absolute links.
 
 Upstream release lookups are authenticated with the workflow's
 `GITHUB_TOKEN`. Unauthenticated GitHub API calls from shared runners hit the
